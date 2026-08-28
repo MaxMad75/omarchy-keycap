@@ -22,7 +22,11 @@
 
 set -uo pipefail
 
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy"
+# A directory of this script's own, created 0700, so no other unprivileged
+# user can place anything inside it. That is defence in depth: the open flags
+# in keycap-cache.py are what actually make the cache safe to touch.
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/keycap"
+CACHE_HELPER="${BASH_SOURCE[0]%/*}/keycap-cache.py"
 KEYBINDINGS_SCRIPT="$(command -v omarchy-menu-keybindings 2>/dev/null || true)"
 
 # Ceilings. Everything this script reads is local and ordinarily small; these
@@ -83,71 +87,32 @@ cache_signature() {
   } | sha256sum | awk '{ print $1 }'
 }
 
-# The cache directory is shared with other tools, so its contents are treated as
-# untrusted input rather than as something this script wrote.
-cache_dir_usable() {
-  [[ ! -L $CACHE_DIR ]] || return 1
-  [[ -d $CACHE_DIR && -O $CACHE_DIR && -w $CACHE_DIR ]] || return 1
-  return 0
+# Cache access goes through keycap-cache.py: O_NOFOLLOW|O_NONBLOCK on the read
+# with every check made against that descriptor, and a create-and-hold
+# descriptor plus atomic replace on the write. Bash can express neither, so it
+# does not try to; without python3 the cache is simply skipped.
+cache_ready() {
+  [[ -n $CACHE_HELPER && -r $CACHE_HELPER ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  step python3 "$CACHE_HELPER" mkdir "$CACHE_DIR" 2>/dev/null
 }
 
-# Reads the cache only if what actually got opened is a regular file this user
-# owns, of sane size, holding the shape this script writes.
-#
-# The name is rejected outright if it is a symlink, but the checks that matter
-# are made against the opened descriptor through /proc/self/fd rather than
-# against the path, so nothing can be swapped between the check and the read.
 read_cache() {
-  local file="$1" fd info kind uid size body
-
-  # -f rejects a fifo or device before the open, which would otherwise block
-  # until the overall deadline fires. The authoritative checks still happen on
-  # the descriptor below; this only keeps the common case from stalling.
-  [[ -f $file && ! -L $file ]] || return 1
-
-  exec {fd}<"$file" 2>/dev/null || return 1
-  info=$(stat -L -c '%F|%u|%s' "/proc/self/fd/$fd" 2>/dev/null) || { exec {fd}<&-; return 1; }
-  IFS='|' read -r kind uid size <<<"$info"
-
-  if [[ $kind != "regular file" || $uid != "$(id -u)" ]] \
-    || [[ ! $size =~ ^[0-9]+$ ]] || (( size == 0 || size > CACHE_MAX_BYTES )); then
-    exec {fd}<&-
-    return 1
-  fi
-
-  body=$(step head -c "$CACHE_MAX_BYTES" <&"$fd" 2>/dev/null) || { exec {fd}<&-; return 1; }
-  exec {fd}<&-
-
-  jq -e 'type == "object" and has("byApp") and has("byCmd") and has("byRoute") and has("byName")' \
-    >/dev/null 2>&1 <<<"$body" || return 1
-
-  printf '%s\n' "$body"
+  step python3 "$CACHE_HELPER" read "$1" 2>/dev/null
 }
 
-# Publishes through a temporary file in the same directory and an atomic
-# rename, so a pre-existing symlink at the destination is replaced rather than
-# followed and truncated, and no reader ever sees a half-written file.
 write_cache() {
-  local source="$1" dest="$2" tmp
-
-  cache_dir_usable || return 1
-  tmp=$(mktemp "$CACHE_DIR/.keycap.XXXXXX" 2>/dev/null) || return 1
-  if ! cat -- "$source" >"$tmp" 2>/dev/null; then
-    rm -f -- "$tmp"
-    return 1
-  fi
-  chmod 600 -- "$tmp" 2>/dev/null
-  mv -f -- "$tmp" "$dest" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
-  return 0
+  step python3 "$CACHE_HELPER" write "$2" "$1" 2>/dev/null
 }
 
 cache_file=""
-if [[ ${1:-} != "--no-cache" ]]; then
+if [[ ${1:-} != "--no-cache" ]] && cache_ready; then
   signature=$(cache_signature)
   if [[ -n $signature ]]; then
-    cache_file="$CACHE_DIR/keycap-$signature.json"
-    if cached=$(read_cache "$cache_file"); then
-      printf '%s\n' "$cached"
+    cache_file="$CACHE_DIR/$signature.json"
+    # Straight to stdout: the helper prints only after every check has passed,
+    # so nothing partial escapes, and no 1 MiB shell variable is needed.
+    if read_cache "$cache_file"; then
       exit 0
     fi
   fi
@@ -452,12 +417,9 @@ out_size=$(stat -c '%s' -- "$workdir/out.json" 2>/dev/null || echo 0)
 (( out_size > 0 && out_size <= OUTPUT_MAX_BYTES )) || emit_empty
 
 if [[ -n $cache_file ]]; then
-  mkdir -p "$CACHE_DIR" 2>/dev/null
-  if cache_dir_usable; then
-    # Stale keys pile up otherwise: every rebind writes a new signature.
-    command find "$CACHE_DIR" -maxdepth 1 -type f -name 'keycap-*.json' -delete 2>/dev/null
-    write_cache "$workdir/out.json" "$cache_file" || true
-  fi
+  # Stale keys pile up otherwise: every rebind writes a new signature.
+  command find "$CACHE_DIR" -maxdepth 1 -type f -name '*.json' -delete 2>/dev/null
+  write_cache "$workdir/out.json" "$cache_file" || true
 fi
 
 cat -- "$workdir/out.json"

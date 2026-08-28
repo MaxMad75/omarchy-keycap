@@ -108,13 +108,21 @@ point for a trailing column, so there is no way to add one without forking.
 Everything Keycap reads is local, but the shell process it runs inside is
 long-lived and shared, so local input is still treated as untrusted:
 
-- The cache lives in `~/.cache/omarchy/`, a directory other tools write to. It
-  is published through a temporary file in that same directory plus an atomic
-  rename, so a symlink planted at the destination is replaced rather than
-  followed and truncated. Reading validates the **opened descriptor** through
-  `/proc/self/fd` — regular file, owned by this user, within 1 MiB, parsing to
-  the expected shape — so nothing can be swapped in between the check and the
-  read.
+- All cache I/O goes through [`bin/keycap-cache.py`](bin/keycap-cache.py),
+  because the guarantees needed here are open flags the shell cannot express.
+  Reading opens with `O_NOFOLLOW|O_NONBLOCK` and decides everything from
+  `fstat` on that one descriptor — regular file, owned by this user, within
+  1 MiB, parsing to the expected shape. Checking a pathname and opening it
+  afterwards would leave a window in which the name can be swapped for a
+  symlink; there is no window here, because the kernel refuses the symlink at
+  open time. Writing creates its temporary with `O_CREAT|O_EXCL|O_NOFOLLOW`
+  and holds that descriptor through write, verification and `fsync` without
+  ever reopening the name, then publishes with `os.replace`, which swaps the
+  directory entry atomically and replaces a symlink at the destination rather
+  than following it.
+- The cache lives in `~/.cache/omarchy/keycap/`, created `0700` and verified
+  by `lstat` to be a directory this user owns with no group or other access.
+  That is defence in depth; the open flags above are the actual control.
 - The whole resolve runs under a 20 s deadline and every external step under
   8 s, so a wedged `hyprctl` cannot stall the menu.
 - Bindings, desktop entries, matches and total output are capped, and `Menu.qml`
@@ -126,10 +134,12 @@ exactly as it did before.
 ## Requirements
 
 Omarchy 4 (Quattro) with `omarchy-shell`. The resolver uses `hyprctl`, `lua`,
-`jq`, `xdg-settings` and `omarchy-menu-keybindings` — all of which a stock
-Omarchy install already has. No network access, no other external dependencies.
-If any of them is missing, the resolver returns empty maps and the menu renders
-exactly as it did before.
+`jq`, `xdg-settings` and `omarchy-menu-keybindings`, and the cache helper uses
+`python3` — all of which a stock Omarchy install already has (`uwsm`, which
+launches everything on the desktop, depends on python itself). No network
+access, no other external dependencies. If `python3` is missing the cache is
+skipped and every menu open pays the full resolve; if anything else is missing,
+the resolver returns empty maps and the menu renders exactly as it did before.
 
 ## License
 
