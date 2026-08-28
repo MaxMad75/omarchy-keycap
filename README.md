@@ -113,6 +113,6 @@ exactly as it did before.
 
 ## License
 
-MIT. `Menu.qml`, `MenuModel.js` and `BarWidget.qml` are derived from the
-[Omarchy](https://github.com/basecamp/omarchy) menu plugin, Copyright (c) David
-Heinemeier Hansson, also MIT. See [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). `Menu.qml`, `MenuModel.js` and `BarWidget.qml`
+are derived from the [Omarchy](https://github.com/basecamp/omarchy) menu plugin,
+Copyright (c) David Heinemeier Hansson, also MIT; see [NOTICE](NOTICE).

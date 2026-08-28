@@ -1,0 +1,9 @@
+Keycap
+Copyright (c) 2026 MaxMad75
+
+Menu.qml, MenuModel.js and BarWidget.qml are derived from the menu plugin of
+Omarchy (https://github.com/basecamp/omarchy), taken from release 4.0.0.
+
+    Copyright (c) David Heinemeier Hansson
+
+Omarchy is licensed under the MIT License, the same terms carried in LICENSE.
