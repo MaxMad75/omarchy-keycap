@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.maxmad75.keycap",
   "name": "Keycap",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "MaxMad75",
   "description": "Shows the Hyprland keybinding next to every app and setting in the Omarchy menu, so keybinds, keybindings, shortcuts and hotkeys are visible where you already look.",
   "kinds": [

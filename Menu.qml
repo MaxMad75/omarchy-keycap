@@ -618,6 +618,7 @@ Item {
 
   function loadShortcuts() {
     if (shortcutProc.running || root.pluginDir.length === 0) return
+    shortcutProc.overflowed = false
     shortcutProc.collected = ""
     shortcutProc.running = true
   }
@@ -971,12 +972,29 @@ Item {
     property string collected: ""
     // "$0" rather than interpolation: a plugin directory may contain spaces.
     command: ["bash", "-lc", "exec \"$0\"", root.pluginDir + "/bin/keycap-resolve"]
+    // The resolver caps its own output, but this process is long-lived and the
+    // one reading it, so the ceiling is enforced on this side too: past it the
+    // batch is abandoned rather than accumulated.
+    readonly property int maxBytes: 524288
+    property bool overflowed: false
     stdout: SplitParser {
-      onRead: function(data) { shortcutProc.collected += data + "\n" }
+      onRead: function(data) {
+        if (shortcutProc.overflowed) return
+        if (shortcutProc.collected.length + data.length > shortcutProc.maxBytes) {
+          shortcutProc.overflowed = true
+          shortcutProc.collected = ""
+          console.warn("keycap: resolver output exceeded " + shortcutProc.maxBytes + " bytes, ignoring it")
+          return
+        }
+        shortcutProc.collected += data + "\n"
+      }
     }
     onExited: function(exitCode, exitStatus) {
       var parsed = ({})
-      try { parsed = JSON.parse(shortcutProc.collected) } catch (e) { parsed = ({}) }
+      if (!shortcutProc.overflowed) {
+        try { parsed = JSON.parse(shortcutProc.collected) } catch (e) { parsed = ({}) }
+      }
+      shortcutProc.overflowed = false
       shortcutProc.collected = ""
       root.shortcuts = parsed
       root.shortcutsSerial += 1

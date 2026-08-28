@@ -25,14 +25,44 @@ set -uo pipefail
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy"
 KEYBINDINGS_SCRIPT="$(command -v omarchy-menu-keybindings 2>/dev/null || true)"
 
+# Ceilings. Everything this script reads is local and ordinarily small; these
+# exist so that nothing local and unexpectedly large — a planted cache file, a
+# pathological desktop tree, a hung hyprctl — can turn into unbounded work or
+# unbounded memory in the long-lived shell process that consumes the output.
+OVERALL_TIMEOUT=20     # seconds for the whole resolve
+STEP_TIMEOUT=8         # seconds for any single external step
+CACHE_MAX_BYTES=1048576
+OUTPUT_MAX_BYTES=524288
+MAX_BINDS=2000
+MAX_DESKTOP_FILES=5000
+MAX_CLAIMS=20000
+
 emit_empty() {
   echo '{"byApp":{},"byCmd":{},"byRoute":{},"byName":{}}'
   exit 0
 }
 
+# One firm deadline for the whole run, applied by re-executing under timeout.
+# A run killed here writes nothing on stdout, and the caller treats unparseable
+# output as an empty result, so the menu renders as it did before.
+if [[ -z ${KEYCAP_DEADLINE:-} ]] && command -v timeout >/dev/null 2>&1; then
+  export KEYCAP_DEADLINE=1
+  exec timeout -k 3 "$OVERALL_TIMEOUT" "$0" ${1+"$@"}
+fi
+
 command -v lua >/dev/null 2>&1 || emit_empty
 command -v jq >/dev/null 2>&1 || emit_empty
 [[ -n $KEYBINDINGS_SCRIPT && -r $KEYBINDINGS_SCRIPT ]] || emit_empty
+
+# Bound any single external step as well, so one wedged command cannot eat the
+# whole deadline and starve the rest.
+step() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout -k 2 "$STEP_TIMEOUT" "$@"
+  else
+    "$@"
+  fi
+}
 
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/keycap-resolve.XXXXXX") || emit_empty
 trap 'rm -rf "$workdir"' EXIT
@@ -44,8 +74,8 @@ trap 'rm -rf "$workdir"' EXIT
 # cache on both.
 cache_signature() {
   {
-    printf 'v1\n'
-    hyprctl binds 2>/dev/null
+    printf 'v2\n'
+    step hyprctl binds 2>/dev/null
     stat -c '%n %Y' \
       "${XDG_DATA_HOME:-$HOME/.local/share}/applications" \
       /usr/share/applications \
@@ -53,13 +83,71 @@ cache_signature() {
   } | sha256sum | awk '{ print $1 }'
 }
 
+# The cache directory is shared with other tools, so its contents are treated as
+# untrusted input rather than as something this script wrote.
+cache_dir_usable() {
+  [[ ! -L $CACHE_DIR ]] || return 1
+  [[ -d $CACHE_DIR && -O $CACHE_DIR && -w $CACHE_DIR ]] || return 1
+  return 0
+}
+
+# Reads the cache only if what actually got opened is a regular file this user
+# owns, of sane size, holding the shape this script writes.
+#
+# The name is rejected outright if it is a symlink, but the checks that matter
+# are made against the opened descriptor through /proc/self/fd rather than
+# against the path, so nothing can be swapped between the check and the read.
+read_cache() {
+  local file="$1" fd info kind uid size body
+
+  # -f rejects a fifo or device before the open, which would otherwise block
+  # until the overall deadline fires. The authoritative checks still happen on
+  # the descriptor below; this only keeps the common case from stalling.
+  [[ -f $file && ! -L $file ]] || return 1
+
+  exec {fd}<"$file" 2>/dev/null || return 1
+  info=$(stat -L -c '%F|%u|%s' "/proc/self/fd/$fd" 2>/dev/null) || { exec {fd}<&-; return 1; }
+  IFS='|' read -r kind uid size <<<"$info"
+
+  if [[ $kind != "regular file" || $uid != "$(id -u)" ]] \
+    || [[ ! $size =~ ^[0-9]+$ ]] || (( size == 0 || size > CACHE_MAX_BYTES )); then
+    exec {fd}<&-
+    return 1
+  fi
+
+  body=$(step head -c "$CACHE_MAX_BYTES" <&"$fd" 2>/dev/null) || { exec {fd}<&-; return 1; }
+  exec {fd}<&-
+
+  jq -e 'type == "object" and has("byApp") and has("byCmd") and has("byRoute") and has("byName")' \
+    >/dev/null 2>&1 <<<"$body" || return 1
+
+  printf '%s\n' "$body"
+}
+
+# Publishes through a temporary file in the same directory and an atomic
+# rename, so a pre-existing symlink at the destination is replaced rather than
+# followed and truncated, and no reader ever sees a half-written file.
+write_cache() {
+  local source="$1" dest="$2" tmp
+
+  cache_dir_usable || return 1
+  tmp=$(mktemp "$CACHE_DIR/.keycap.XXXXXX" 2>/dev/null) || return 1
+  if ! cat -- "$source" >"$tmp" 2>/dev/null; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 600 -- "$tmp" 2>/dev/null
+  mv -f -- "$tmp" "$dest" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  return 0
+}
+
 cache_file=""
 if [[ ${1:-} != "--no-cache" ]]; then
   signature=$(cache_signature)
   if [[ -n $signature ]]; then
     cache_file="$CACHE_DIR/keycap-$signature.json"
-    if [[ -s $cache_file ]]; then
-      cat "$cache_file"
+    if cached=$(read_cache "$cache_file"); then
+      printf '%s\n' "$cached"
       exit 0
     fi
   fi
@@ -72,7 +160,7 @@ awk "/^ *lua <<.LUA.\$/{f=1;next} f&&/^LUA\$/{exit} f" \
   "$KEYBINDINGS_SCRIPT" >"$workdir/shim.lua" 2>/dev/null
 [[ -s $workdir/shim.lua ]] || emit_empty
 
-lua "$workdir/shim.lua" >"$workdir/binds.tsv" 2>/dev/null
+step lua "$workdir/shim.lua" 2>/dev/null | head -n "$MAX_BINDS" >"$workdir/binds.tsv"
 [[ -s $workdir/binds.tsv ]] || emit_empty
 
 # ------------------------------------------------------------- desktop entries
@@ -96,9 +184,11 @@ collect_desktop_entries() {
     done
   done
   (( ${#files[@]} )) || return 0
+  # A pathological tree is truncated rather than walked to exhaustion.
+  (( ${#files[@]} > MAX_DESKTOP_FILES )) && files=("${files[@]:0:MAX_DESKTOP_FILES}")
 
   # One pass over every file: a per-file awk costs seconds on a full XDG tree.
-  awk '
+  step awk '
     function flush() {
       if (id != "" && !skip && name != "") printf "%s\t%s\t%s\n", id, name, exec
     }
@@ -116,6 +206,7 @@ collect_desktop_entries() {
     END { flush() }
   ' "${files[@]}"
 }
+
 
 collect_desktop_entries >"$workdir/apps.tsv" 2>/dev/null || : >"$workdir/apps.tsv"
 
@@ -342,7 +433,8 @@ done <"$workdir/binds.tsv"
 
 # --------------------------------------------------------------------- packing
 
-sort -t$'\t' -k1,1 -k2,2 -k4,4n "$workdir/claims.tsv" |
+head -n "$MAX_CLAIMS" "$workdir/claims.tsv" |
+  sort -t$'\t' -k1,1 -k2,2 -k4,4n |
   awk -F'\t' '!seen[$1 "\t" $2]++' |
   jq -R -s '
     split("\n")
@@ -354,10 +446,18 @@ sort -t$'\t' -k1,1 -k2,2 -k4,4n "$workdir/claims.tsv" |
   ' >"$workdir/out.json" 2>/dev/null || emit_empty
 [[ -s $workdir/out.json ]] || emit_empty
 
-if [[ -n $cache_file ]] && mkdir -p "$CACHE_DIR" 2>/dev/null; then
-  # Stale keys pile up otherwise: every rebind writes a new signature.
-  command find "$CACHE_DIR" -maxdepth 1 -type f -name 'keycap-*.json' -delete 2>/dev/null
-  cp "$workdir/out.json" "$cache_file" 2>/dev/null
+# Refuse to hand the shell process something oversized, whatever produced it.
+out_size=$(stat -c '%s' -- "$workdir/out.json" 2>/dev/null || echo 0)
+[[ $out_size =~ ^[0-9]+$ ]] || emit_empty
+(( out_size > 0 && out_size <= OUTPUT_MAX_BYTES )) || emit_empty
+
+if [[ -n $cache_file ]]; then
+  mkdir -p "$CACHE_DIR" 2>/dev/null
+  if cache_dir_usable; then
+    # Stale keys pile up otherwise: every rebind writes a new signature.
+    command find "$CACHE_DIR" -maxdepth 1 -type f -name 'keycap-*.json' -delete 2>/dev/null
+    write_cache "$workdir/out.json" "$cache_file" || true
+  fi
 fi
 
-cat "$workdir/out.json"
+cat -- "$workdir/out.json"

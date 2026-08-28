@@ -103,6 +103,26 @@ or remove Keycap, which restores the shipped menu in one command.
 This is the honest cost of the feature: Omarchy's menu rows have no extension
 point for a trailing column, so there is no way to add one without forking.
 
+## How it handles its own inputs
+
+Everything Keycap reads is local, but the shell process it runs inside is
+long-lived and shared, so local input is still treated as untrusted:
+
+- The cache lives in `~/.cache/omarchy/`, a directory other tools write to. It
+  is published through a temporary file in that same directory plus an atomic
+  rename, so a symlink planted at the destination is replaced rather than
+  followed and truncated. Reading validates the **opened descriptor** through
+  `/proc/self/fd` — regular file, owned by this user, within 1 MiB, parsing to
+  the expected shape — so nothing can be swapped in between the check and the
+  read.
+- The whole resolve runs under a 20 s deadline and every external step under
+  8 s, so a wedged `hyprctl` cannot stall the menu.
+- Bindings, desktop entries, matches and total output are capped, and `Menu.qml`
+  enforces its own 512 KiB ceiling on what it will accumulate from the resolver.
+
+Any of these limits being hit yields an empty result, and the menu renders
+exactly as it did before.
+
 ## Requirements
 
 Omarchy 4 (Quattro) with `omarchy-shell`. The resolver uses `hyprctl`, `lua`,
