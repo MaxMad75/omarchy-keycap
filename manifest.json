@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.maxmad75.keycap",
+  "name": "Keycap",
+  "version": "1.0.0",
+  "author": "MaxMad75",
+  "description": "Shows the Hyprland keybinding next to every app and setting in the Omarchy menu, so keybinds, keybindings, shortcuts and hotkeys are visible where you already look.",
+  "kinds": [
+    "menu",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "menu": "Menu.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Keycap",
+    "description": "Launches the Omarchy menu",
+    "category": "Compositor",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.menu"
+  }
+}

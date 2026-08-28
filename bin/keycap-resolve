@@ -1,0 +1,363 @@
+#!/bin/bash
+
+# Keycap's resolver. Emits the Hyprland keybindings as JSON maps the Omarchy
+# menu can look rows up in, so the launcher can print "Super+Shift+Y" beside
+# YouTube.
+#
+# Standalone: run it to see what Keycap will show, before it shows it.
+#
+#   { "byApp":   { "<desktop-id>": "Super+Shift+Y" },
+#     "byCmd":   { "<shell command>": "Print" },
+#     "byRoute": { "<omarchy-menu route>": "Super+Ctrl+C" },
+#     "byName":  { "<lowercased bind description>": "Super+K" } }
+#
+# `hyprctl binds` reports every Omarchy binding as dispatcher __lua with an
+# opaque arg, so the real command is recovered the way omarchy-menu-keybindings
+# does it: by replaying ~/.config/hypr/hyprland.lua through a shim that only
+# records o.bind/hl.bind calls. The shim is lifted out of that script at run
+# time rather than copied, so it keeps tracking upstream.
+#
+# Every stage degrades to an empty map instead of failing: a launcher that
+# cannot resolve its shortcuts should still show its rows.
+
+set -uo pipefail
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy"
+KEYBINDINGS_SCRIPT="$(command -v omarchy-menu-keybindings 2>/dev/null || true)"
+
+emit_empty() {
+  echo '{"byApp":{},"byCmd":{},"byRoute":{},"byName":{}}'
+  exit 0
+}
+
+command -v lua >/dev/null 2>&1 || emit_empty
+command -v jq >/dev/null 2>&1 || emit_empty
+[[ -n $KEYBINDINGS_SCRIPT && -r $KEYBINDINGS_SCRIPT ]] || emit_empty
+
+workdir=$(mktemp -d "${TMPDIR:-/tmp}/keycap-resolve.XXXXXX") || emit_empty
+trap 'rm -rf "$workdir"' EXIT
+
+# ------------------------------------------------------------------- the cache
+
+# Resolving costs a second or two, and the launcher asks on every open. The
+# answer only moves when a binding or an installed application does, so key the
+# cache on both.
+cache_signature() {
+  {
+    printf 'v1\n'
+    hyprctl binds 2>/dev/null
+    stat -c '%n %Y' \
+      "${XDG_DATA_HOME:-$HOME/.local/share}/applications" \
+      /usr/share/applications \
+      "$HOME/.config/hypr" 2>/dev/null
+  } | sha256sum | awk '{ print $1 }'
+}
+
+cache_file=""
+if [[ ${1:-} != "--no-cache" ]]; then
+  signature=$(cache_signature)
+  if [[ -n $signature ]]; then
+    cache_file="$CACHE_DIR/keycap-$signature.json"
+    if [[ -s $cache_file ]]; then
+      cat "$cache_file"
+      exit 0
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------- bind records
+
+# The shim lives in a `lua <<'LUA' ... LUA` heredoc inside build_lua_bind_cache.
+awk "/^ *lua <<.LUA.\$/{f=1;next} f&&/^LUA\$/{exit} f" \
+  "$KEYBINDINGS_SCRIPT" >"$workdir/shim.lua" 2>/dev/null
+[[ -s $workdir/shim.lua ]] || emit_empty
+
+lua "$workdir/shim.lua" >"$workdir/binds.tsv" 2>/dev/null
+[[ -s $workdir/binds.tsv ]] || emit_empty
+
+# ------------------------------------------------------------- desktop entries
+
+# id<TAB>Name<TAB>Exec for every visible application, nearest XDG dir first.
+collect_desktop_entries() {
+  local dir file id
+  local -a dirs=("${XDG_DATA_HOME:-$HOME/.local/share}/applications")
+  local search="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+  IFS=: read -r -a extra <<<"$search"
+  for dir in "${extra[@]}"; do
+    [[ -n $dir ]] && dirs+=("$dir/applications")
+  done
+
+  local -a files=()
+  for dir in "${dirs[@]}"; do
+    [[ -d $dir ]] || continue
+    for file in "$dir"/*.desktop; do
+      [[ -f $file ]] && files+=("$file")
+    done
+  done
+  (( ${#files[@]} )) || return 0
+
+  # One pass over every file: a per-file awk costs seconds on a full XDG tree.
+  awk '
+    function flush() {
+      if (id != "" && !skip && name != "") printf "%s\t%s\t%s\n", id, name, exec
+    }
+    FNR == 1 {
+      flush()
+      id = FILENAME; sub(/^.*\//, "", id); sub(/\.desktop$/, "", id)
+      entry = 0; skip = 0; name = ""; exec = ""
+    }
+    /^\[/ { entry = ($0 == "[Desktop Entry]"); next }
+    !entry { next }
+    /^NoDisplay[[:space:]]*=[[:space:]]*true/ { skip = 1; next }
+    /^Hidden[[:space:]]*=[[:space:]]*true/ { skip = 1; next }
+    /^Name[[:space:]]*=/ { if (name == "") { sub(/^Name[[:space:]]*=[[:space:]]*/, ""); name = $0 } next }
+    /^Exec[[:space:]]*=/ { if (exec == "") { sub(/^Exec[[:space:]]*=[[:space:]]*/, ""); exec = $0 } next }
+    END { flush() }
+  ' "${files[@]}"
+}
+
+collect_desktop_entries >"$workdir/apps.tsv" 2>/dev/null || : >"$workdir/apps.tsv"
+
+# First desktop id whose Exec contains $1 verbatim.
+app_by_exec_fragment() {
+  local fragment="$1"
+  [[ -n $fragment ]] || return 1
+  awk -F'\t' -v needle="$fragment" 'index($3, needle) { print $1; exit }' "$workdir/apps.tsv"
+}
+
+# First desktop id whose Exec starts with the binary $1.
+app_by_binary() {
+  local binary="$1"
+  [[ -n $binary ]] || return 1
+  awk -F'\t' -v bin="$binary" '
+    { split($3, parts, " "); cmd = parts[1]; sub(/^.*\//, "", cmd) }
+    cmd == bin { print $1; exit }
+  ' "$workdir/apps.tsv"
+}
+
+# First desktop id whose id or Name looks like $1.
+app_by_slug() {
+  local slug="${1,,}"
+  [[ -n $slug ]] || return 1
+  awk -F'\t' -v slug="$slug" '
+    { id = tolower($1); name = tolower($2)
+      gsub(/[^a-z0-9]/, "", id); gsub(/[^a-z0-9]/, "", name) }
+    id == slug || name == slug { print $1; exit }
+  ' "$workdir/apps.tsv"
+}
+
+declare -A RESOLVED=()
+
+# xdg-settings costs half a second, and three bindings open the browser.
+default_browser_app() {
+  local desktop
+  if [[ -z ${RESOLVED[browser]+set} ]]; then
+    desktop=$(xdg-settings get default-web-browser 2>/dev/null)
+    RESOLVED[browser]="${desktop%.desktop}"
+  fi
+  [[ -n ${RESOLVED[browser]} ]] || return 1
+  printf '%s\n' "${RESOLVED[browser]}"
+}
+
+default_terminal_app() {
+  if [[ -n ${RESOLVED[terminal]+set} ]]; then
+    [[ -n ${RESOLVED[terminal]} ]] || return 1
+    printf '%s\n' "${RESOLVED[terminal]}"
+    return 0
+  fi
+  RESOLVED[terminal]=$(resolve_terminal_app)
+  [[ -n ${RESOLVED[terminal]} ]] || return 1
+  printf '%s\n' "${RESOLVED[terminal]}"
+}
+
+resolve_terminal_app() {
+  local list line candidate
+  for list in "${XDG_CONFIG_HOME:-$HOME/.config}/xdg-terminals.list" /etc/xdg/xdg-terminals.list; do
+    [[ -r $list ]] || continue
+    while read -r line; do
+      [[ -n $line && $line != \#* ]] || continue
+      printf '%s\n' "${line%.desktop}"
+      return 0
+    done <"$list"
+  done
+  for candidate in foot alacritty kitty com.mitchellh.ghostty ghostty; do
+    if app_by_slug "$candidate" >/dev/null 2>&1; then
+      app_by_slug "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# --------------------------------------------------------------- key rendering
+
+# Hyprland modmask bits. MOD2..MOD5 carry no label anyone would recognize.
+# These write into globals rather than echoing: a $(...) per binding is a fork
+# per binding, and there are a couple of hundred of them.
+render_modifiers() {
+  local mask="$1"
+  MODS_OUT=""
+  (( mask & 64 )) && MODS_OUT+="Super+"
+  (( mask & 4 ))  && MODS_OUT+="Ctrl+"
+  (( mask & 8 ))  && MODS_OUT+="Alt+"
+  (( mask & 1 ))  && MODS_OUT+="Shift+"
+}
+
+# Names Hyprland reports that would read as shouting in a launcher row.
+render_key() {
+  local key="$1"
+
+  case "$key" in
+    "" | mouse:* | XF86*) return 1 ;;
+    code:*)
+      # Same fallback table omarchy-menu-keybindings uses for the number row.
+      case "${key#code:}" in
+        10) key="1" ;; 11) key="2" ;; 12) key="3" ;; 13) key="4" ;; 14) key="5" ;;
+        15) key="6" ;; 16) key="7" ;; 17) key="8" ;; 18) key="9" ;; 19) key="0" ;;
+        20) key="-" ;; 21) key="=" ;; 59) key="," ;; 60) key="." ;; 61) key="/" ;;
+        *) return 1 ;;
+      esac
+      ;;
+  esac
+
+  case "${key^^}" in
+    RETURN | ENTER) key="Enter" ;;
+    SPACE) key="Space" ;;
+    ESCAPE | ESC) key="Esc" ;;
+    PRINT) key="Print" ;;
+    BACKSPACE) key="Backspace" ;;
+    DELETE) key="Del" ;;
+    TAB) key="Tab" ;;
+    SLASH) key="/" ;;
+    COMMA) key="," ;;
+    PERIOD) key="." ;;
+    MINUS) key="-" ;;
+    EQUAL) key="=" ;;
+    LEFT) key="←" ;;
+    RIGHT) key="→" ;;
+    UP) key="↑" ;;
+    DOWN) key="↓" ;;
+    *) [[ ${#key} == 1 ]] && key="${key^^}" ;;
+  esac
+
+  KEY_OUT="$key"
+}
+
+# How many modifiers a combo carries; the plainest binding for a target wins.
+modifier_count() {
+  local mask="$1" bit
+  RANK_OUT=0
+  for bit in 1 4 8 64; do
+    (( mask & bit )) && (( RANK_OUT++ ))
+  done
+}
+
+# ------------------------------------------------------------------- targeting
+
+: >"$workdir/claims.tsv"
+
+# scope, key, combo, rank — lowest rank per (scope,key) is kept.
+claim() {
+  local scope="$1" key="$2" combo="$3" rank="$4"
+  [[ -n $key ]] || return 0
+  printf '%s\t%s\t%s\t%s\n' "$scope" "$key" "$combo" "$rank" >>"$workdir/claims.tsv"
+}
+
+# Strips the wrappers Omarchy puts in front of the command that matters.
+normalize_command() {
+  local cmd="$1"
+  cmd="${cmd#uwsm-app -- }"
+  cmd="${cmd#setsid }"
+  # Collapse whitespace without leaving bash: two subprocesses per binding puts
+  # seconds on a run over two hundred of them.
+  cmd="${cmd//$'\t'/ }"
+  cmd="${cmd//$'\n'/ }"
+  while [[ $cmd == *"  "* ]]; do cmd="${cmd//  / }"; done
+  cmd="${cmd# }"
+  cmd="${cmd% }"
+  CMD_OUT="$cmd"
+}
+
+while IFS=$'\t' read -r modmask description key kind arg; do
+  [[ -n ${description:-} ]] || continue
+
+  render_key "${key:-}" || continue
+  render_modifiers "${modmask:-0}"
+  modifier_count "${modmask:-0}"
+  combo="$MODS_OUT$KEY_OUT"
+  rank="$RANK_OUT"
+
+  desc_lower="${description,,}"
+  claim "byName" "$desc_lower" "$combo" "$rank"
+  # "Capture menu" opens the row labelled "Capture".
+  [[ $desc_lower == *" menu" ]] && claim "byName" "${desc_lower% menu}" "$combo" "$rank"
+
+  [[ ${kind:-} == "exec" && -n ${arg:-} ]] || continue
+  normalize_command "$arg"
+  command_line="$CMD_OUT"
+  claim "byCmd" "$command_line" "$combo" "$rank"
+
+  # A submenu binding names the route it opens.
+  if [[ $command_line =~ ^omarchy-menu[[:space:]]+toggle([[:space:]]+([^[:space:]]+))?$ ]]; then
+    route="${BASH_REMATCH[2]:-root}"
+    claim "byRoute" "$route" "$combo" "$rank"
+    continue
+  fi
+
+  # Web apps: the .desktop entry runs the very same launcher and URL. The two
+  # spellings disagree about the trailing slash (the binding for Google Maps
+  # says maps.google.com/, its desktop entry says maps.google.com), so match on
+  # the URL without it.
+  if [[ $command_line =~ (https?://[^\'\"[:space:]]+) ]]; then
+    url="${BASH_REMATCH[1]%/}"
+    if app_id=$(app_by_exec_fragment "$url") && [[ -n $app_id ]]; then
+      claim "byApp" "$app_id" "$combo" "$rank"
+      continue
+    fi
+  fi
+
+  # omarchy-launch-or-focus '<pattern>' 'uwsm-app -- <binary>'
+  if [[ $command_line =~ uwsm-app[[:space:]]--[[:space:]]+\'?([A-Za-z0-9._-]+) ]]; then
+    if app_id=$(app_by_binary "${BASH_REMATCH[1]}") && [[ -n $app_id ]]; then
+      claim "byApp" "$app_id" "$combo" "$rank"
+      continue
+    fi
+  fi
+
+  # omarchy-launch-<slug> [args]
+  if [[ $command_line =~ ^omarchy-launch-([a-z0-9-]+) ]]; then
+    slug="${BASH_REMATCH[1]}"
+    app_id=""
+    case "$slug" in
+      browser) app_id=$(default_browser_app) ;;
+      terminal) app_id=$(default_terminal_app) ;;
+      nautilus | nautilus-cwd) app_id=$(app_by_binary nautilus) ;;
+      webapp | or-focus-webapp | tui | or-focus-tui | or-focus | editor) app_id="" ;;
+      *) app_id=$(app_by_slug "$slug") ;;
+    esac
+    [[ -n $app_id ]] && claim "byApp" "$app_id" "$combo" "$rank"
+  fi
+done <"$workdir/binds.tsv"
+
+# --------------------------------------------------------------------- packing
+
+sort -t$'\t' -k1,1 -k2,2 -k4,4n "$workdir/claims.tsv" |
+  awk -F'\t' '!seen[$1 "\t" $2]++' |
+  jq -R -s '
+    split("\n")
+    | map(select(length > 0) | split("\t"))
+    | reduce .[] as $row (
+        { byApp: {}, byCmd: {}, byRoute: {}, byName: {} };
+        .[$row[0]][$row[1]] = $row[2]
+      )
+  ' >"$workdir/out.json" 2>/dev/null || emit_empty
+[[ -s $workdir/out.json ]] || emit_empty
+
+if [[ -n $cache_file ]] && mkdir -p "$CACHE_DIR" 2>/dev/null; then
+  # Stale keys pile up otherwise: every rebind writes a new signature.
+  command find "$CACHE_DIR" -maxdepth 1 -type f -name 'keycap-*.json' -delete 2>/dev/null
+  cp "$workdir/out.json" "$cache_file" 2>/dev/null
+fi
+
+cat "$workdir/out.json"
